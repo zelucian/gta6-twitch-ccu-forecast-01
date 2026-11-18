@@ -1,45 +1,53 @@
-"""Reproducible LOO grid; caches only individual comparable preparations."""
-import sys
+"""Reproducible LOO grid caching only individual comparable preparations."""
+
+import json
 from pathlib import Path
+import sys
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import main
 from dev.common import KIT, load_case
 from dev.loo import evaluate
-import json
 
 
 def run(comparables, config):
-    prepared = {id(c): main.prepare(c) for c in comparables}
-    return evaluate(comparables, lambda case: main.predict(case, **config,
-                    prepared=[prepared[id(c)] for c in case['comparables']]))
+    prepared = {id(comparable): main.prepare(comparable) for comparable in comparables}
+    return evaluate(comparables, lambda case: main.predict(
+        case, **config, prepared=[prepared[id(comparable)] for comparable in case['comparables']]))
 
 
 def summary(name, config, result, reference):
-    worst = max(result['cases'], key=lambda r: r['loss'])
-    changes = [(r['loss'] - b['loss'], r['name']) for r, b in zip(result['cases'], reference['cases'])]
+    worst = max(result['cases'], key=lambda row: row['loss'])
+    changes = [(row['loss'] - ref['loss'], row['name'])
+               for row, ref in zip(result['cases'], reference['cases'])]
     delta, game = max(changes)
-    return dict(variant=name, config=config, loss=result['loss'],
-                gain_pct=100*(1-result['loss']/reference['loss']),
-                worst_loss=worst['loss'], worst_game=worst['name'],
-                max_regression=delta, regression_game=game)
+    return {
+        'variant': name, 'config': config, 'loss': result['loss'],
+        'gain_pct': 100 * (1 - result['loss'] / reference['loss']),
+        'worst_loss': worst['loss'], 'worst_game': worst['name'],
+        'max_regression': delta, 'regression_game': game,
+    }
 
 
 def main_run():
     comparables = load_case()['comparables']
     reference = run(comparables, {})
     variants = [('pooled', {})]
-    variants += [(f'w_jump_{b}', dict(jump_bw=b)) for b in (.5, 1, 2)]
-    variants += [(f'w_v1_{b}', dict(v1_bw=b)) for b in (.5, 1, 2, 3)]
-    variants += [(f'w_both_{v}_{j}', dict(v1_bw=v, jump_bw=j)) for v in (1, 2) for j in (1, 2)]
-    results = [(name, cfg, run(comparables, cfg)) for name, cfg in variants]
-    best = min(results, key=lambda x: x[2]['loss'])
-    variants2 = [(f'smooth_{s}', dict(best[1], smooth=s)) for s in (.15, .3)]
-    variants2 += [(f'shrink_{s}', dict(best[1], shrink=s)) for s in (.15, .3, .5)]
-    results += [(name, cfg, run(comparables, cfg)) for name, cfg in variants2]
-    rows = [summary(n, c, r, reference) for n,c,r in results]
-    Path('dev/tuning-results.json').write_text(json.dumps(rows, indent=2)+'\n')
+    variants.extend((f'w_jump_{bandwidth}', {'jump_bw': bandwidth}) for bandwidth in (0.5, 1, 2))
+    variants.extend((f'w_v1_{bandwidth}', {'v1_bw': bandwidth}) for bandwidth in (0.5, 1, 2, 3))
+    variants.extend((f'w_both_{viewers}_{jump}', {'v1_bw': viewers, 'jump_bw': jump})
+                    for viewers in (1, 2) for jump in (1, 2))
+    results = [(name, config, run(comparables, config)) for name, config in variants]
+    best = min(results, key=lambda item: item[2]['loss'])[1]
+    variants2 = [(f'smooth_{strength}', {**best, 'smooth': strength}) for strength in (0.15, 0.3)]
+    variants2.extend((f'shrink_{strength}', {**best, 'shrink': strength}) for strength in (0.15, 0.3, 0.5))
+    results.extend((name, config, run(comparables, config)) for name, config in variants2)
+    rows = [summary(name, config, result, reference) for name, config, result in results]
+    Path(__file__).with_name('tuning-results.json').write_text(json.dumps(rows, indent=2) + '\n', encoding='utf-8')
     for row in rows:
-        print(json.dumps(row), flush=True)
+        print(json.dumps(row))
+
 
 if __name__ == '__main__':
     main_run()

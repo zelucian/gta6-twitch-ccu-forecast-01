@@ -1,4 +1,3 @@
-"""Runtime-learned, similarity-weighted release-day log-ratio quantiles."""
 import json
 import math
 import os
@@ -7,24 +6,22 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from statistics import median, fmean
 
-# The grader's -P leaves /bot off sys.path: put it back first, so `import model` finds a model.py shipped beside this file.
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get('MAKEFUN_INPUT_DIR', '/input'))
 OUTPUT_DIR = Path(os.environ.get('MAKEFUN_OUTPUT_DIR', '/output'))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
-CONFIG = dict(v1_bw=1.0, smooth=0.3)
+CONFIG = dict(v1_bw=1.3, shape_bw=0.5, regression_bw=2.0, min_fit=8,
+              smooth=0.3, kernel_weight=0.4)
 
 
-def round2(x: float) -> float | int:
-    """Round half up to two decimals, returning whole numbers as ints."""
-    scaled = x * 100
+def round2(value):
+    scaled = value * 100
     whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 100
-    return int(value) if value.is_integer() else value
+    rounded = (whole + (scaled - whole >= 0.5)) / 100
+    return int(rounded) if rounded.is_integer() else rounded
 
 
 def timestamp(value):
@@ -36,109 +33,160 @@ def log(value):
 
 
 def bins(points, start, count=24):
-    groups = {}
-    for p in points:
-        offset = (timestamp(p['from']) - start).total_seconds() / 3600
-        if 0 <= offset < count and math.isfinite(p['viewers']):
-            groups.setdefault(int(offset) + 1, []).append(p['viewers'])
-    return {h: fmean(groups[h]) for h in sorted(groups)}
+    grouped = {}
+    for point in points:
+        offset = (timestamp(point['from']) - start).total_seconds() / 3600
+        viewers = point['viewers']
+        if 0 <= offset < count and math.isfinite(viewers):
+            grouped.setdefault(int(offset) + 1, []).append(viewers)
+    return {hour: fmean(grouped[hour]) for hour in sorted(grouped)}
 
 
-def features(points, start, checkpoint, v1):
-    pre = bins(points, start - timedelta(hours=24))
-    recent = bins(points, checkpoint - timedelta(hours=3), 3)
-    return (log(v1), log(v1) - log(median(list(pre.values())) ) if pre else None,
-            log(v1) - log(median(list(recent.values()))) if recent else None)
+def shape(points, start):
+    profile = bins(points, start - timedelta(hours=24))
+    if len(profile) < 12:
+        return None
+    logged = {hour: log(value) for hour, value in profile.items()}
+    centre = median(logged.values())
+    return [logged.get(hour, centre) - centre for hour in range(1, 25)]
 
 
-def prepare(c):
-    start = timestamp(c['day_start'])
-    profile = bins(c.get('hourly', []), start)
+def prepare(comparable):
+    start = timestamp(comparable['day_start'])
+    points = comparable['hourly']
+    profile = bins(points, start)
     if 1 not in profile:
         return None
-    return (features(c['hourly'], start, start + timedelta(hours=1), profile[1]),
-            {h: log(profile[h]) - log(profile[1]) for h in sorted(profile) if h >= 2})
+    level = log(profile[1])
+    ratios = {hour: log(value) - level
+              for hour, value in profile.items() if hour >= 2}
+    return level, shape(points, start), ratios
 
 
 def weighted_quantiles(samples):
-    """Interpolate weighted CDF centers, rescaled to include both endpoints.
-
-    Equal weights exactly reproduce linear quantiles at tau * (n - 1).
-    """
-    samples = sorted(samples)
-    centers = []
+    ordered = sorted(samples, key=lambda sample: sample[0])
+    if len(ordered) == 1:
+        return [ordered[0][0]] * len(LEVELS)
+    centres = []
     cumulative = 0.0
-    for value, weight in samples:
-        centers.append((cumulative + weight / 2, value))
+    for value, weight in ordered:
+        centres.append(cumulative + weight / 2)
         cumulative += weight
-    lo, hi = centers[0][0], centers[-1][0]
-    result = []
+    span = centres[-1] - centres[0]
+    positions = [(centre - centres[0]) / span for centre in centres]
+    quantiles = []
+    index = 0
     for tau in LEVELS:
-        target = lo + tau * (hi - lo)
-        j = 0
-        while j + 1 < len(centers) and centers[j + 1][0] < target:
-            j += 1
-        a, x = centers[j]
-        b, y = centers[min(j + 1, len(centers) - 1)]
-        result.append(x if b <= a else x + (y - x) * (target - a) / (b - a))
+        while index < len(positions) - 2 and positions[index + 1] < tau:
+            index += 1
+        fraction = (tau - positions[index]) / (positions[index + 1] - positions[index])
+        lower = ordered[index][0]
+        upper = ordered[index + 1][0]
+        quantiles.append(lower + fraction * (upper - lower))
+    return quantiles
+
+
+def finish(curves, p1, smooth):
+    result = {}
+    level = log(p1)
+    ceiling = math.log(1e9)
+    for hour, row in sorted(curves.items()):
+        neighbours = [curves[adjacent] for adjacent in (hour - 1, hour + 1)
+                      if adjacent in curves]
+        blended = [(1 - smooth) * value + smooth * fmean(
+            neighbour[index] for neighbour in neighbours)
+            if neighbours else value for index, value in enumerate(row)]
+        result[hour] = [round2(max(0.01, math.exp(min(ceiling, level + value))))
+                        for value in blended]
     return result
 
 
-def predict(case, v1_bw=None, jump_bw=None, recent_bw=None, smooth=0.0, shrink=0.0,
-            prepared=None):
-    first = next((p['viewers'] for p in case.get('known', []) if p['hour'] == 1), None)
-    history = case.get('history_hourly', [])
+def predict(case, v1_bw=1.3, shape_bw=0.5, regression_bw=2.0, min_fit=8,
+            smooth=0.3, kernel_weight=0.4, prepared=None):
+    first = next((row['viewers'] for row in case.get('known', [])
+                  if row['hour'] == 1), None)
     if first is None:
-        available = history or case.get('history', [])
-        first = max(available, key=lambda p: p.get('from', p.get('at', '')))['viewers'] if available else 1
+        history = case.get('history_hourly') or case.get('history') or []
+        latest = max(history, key=lambda point: timestamp(
+            point.get('from') or point['at'])) if history else None
+        first = latest['viewers'] if latest else 1
     p1 = max(1, first)
-    start = timestamp(case['day_start'])
-    target = features(history, start, timestamp(case['checkpoint']), p1)
-    training = prepared if prepared is not None else [prepare(c) for c in case.get('comparables', [])]
-    samples = {h: [] for h in range(2, 25)}
-    for item in training:
-        if item is None:
+    target = log(p1)
+    target_shape = shape(case.get('history_hourly') or [], timestamp(case['day_start']))
+    training = prepared if prepared is not None else (
+        prepare(comparable) for comparable in case.get('comparables', []))
+    samples = {hour: [] for hour in range(2, 25)}
+    for comparable in training:
+        if comparable is None:
             continue
-        feature, ratios = item
-        distance = 0.0
-        for x, y, bw in zip(target, feature, (v1_bw, jump_bw, recent_bw)):
-            if bw is not None and x is not None and y is not None:
-                distance += ((x - y) / bw) ** 2
-        weight = max(1e-12, math.exp(-min(700, distance / 2)))
-        for h in sorted(ratios):
-            samples[h].append((ratios[h], weight))
-    all_samples = [s for h in range(2, 25) for s in samples[h]]
-    curves = {}
-    for h in range(2, 25):
-        data = samples[h] or [(r, 1) for r, _ in all_samples]
-        if data:
-            qs = weighted_quantiles(data)
-            pooled = weighted_quantiles([(r, 1) for r, _ in data])
-            curves[h] = [(1 - shrink) * a + shrink * b for a, b in zip(qs, pooled)]
-        else:
-            curves[h] = [z * .15 * math.sqrt(h - 1) for z in Z]
+        level, comp_shape, ratios = comparable
+        distance = ((target - level) / v1_bw) ** 2
+        if target_shape is not None and comp_shape is not None:
+            distance += fmean((target_value - comp_value) ** 2
+                              for target_value, comp_value in zip(target_shape, comp_shape)) / shape_bw ** 2
+        weight = max(1e-12, math.exp(-distance / 2))
+        local_weight = max(1e-12, math.exp(-0.5 * ((level - target) / regression_bw) ** 2))
+        for hour, ratio in ratios.items():
+            samples[hour].append((ratio, level, weight, local_weight))
+
+    pooled = [(sample[0], 1) for hour_samples in samples.values() for sample in hour_samples]
+    fallback_curves = {}
+    kernel_curves = {}
+    regression_curves = {}
+    for hour, hour_samples in samples.items():
+        fallback = [(sample[0], 1) for sample in hour_samples] or pooled
+        fallback_curves[hour] = weighted_quantiles(fallback) if fallback else [
+            score * 0.15 * math.sqrt(hour - 1) for score in Z]
+        kernel_curves[hour] = weighted_quantiles([
+            (sample[0], sample[2]) for sample in hour_samples
+        ]) if hour_samples else fallback_curves[hour]
+        if len(hour_samples) < min_fit:
+            regression_curves[hour] = fallback_curves[hour]
+            continue
+        total_weight = sum(sample[3] for sample in hour_samples)
+        xbar = sum(level * local_weight for ratio, level, weight, local_weight
+                   in hour_samples) / total_weight
+        ybar = sum(ratio * local_weight for ratio, level, weight, local_weight
+                   in hour_samples) / total_weight
+        variance = sum(local_weight * (level - xbar) ** 2
+                       for ratio, level, weight, local_weight in hour_samples)
+        covariance = sum(local_weight * (level - xbar) * (ratio - ybar)
+                         for ratio, level, weight, local_weight in hour_samples)
+        slope = covariance / variance if variance else 0
+        mu = ybar + slope * (target - xbar)
+        residuals = [(ratio - (ybar + slope * (level - xbar)), local_weight)
+                     for ratio, level, weight, local_weight in hour_samples]
+        regression_curves[hour] = [mu + value for value in weighted_quantiles(residuals)]
+
+    kernel_forecast = finish(kernel_curves, p1, smooth)
+    regression_forecast = finish(regression_curves, p1, smooth)
     result = {}
-    for h in range(2, 25):
-        neighbors = [curves[k] for k in (h - 1, h + 1) if k in curves]
-        qs = [(1 - smooth) * q + smooth * fmean(n[j] for n in neighbors)
-              for j, q in enumerate(curves[h])]
-        result[h] = [round2(max(.01, math.exp(min(math.log(1e9), log(p1) + q)))) for q in qs]
+    for hour in samples:
+        row = []
+        previous = 0.01
+        for kernel_value, regression_value in zip(kernel_forecast[hour], regression_forecast[hour]):
+            value = round2(math.exp(kernel_weight * math.log(kernel_value)
+                                   + (1 - kernel_weight) * math.log(regression_value)))
+            previous = max(previous, min(1e9, max(0.01, value)))
+            row.append(previous)
+        result[hour] = row
     return result
 
 
 def forecast_case(case, name='case'):
-    if case.get('levels', LEVELS) != LEVELS:
-        raise ValueError(f'{name}: unsupported quantile levels')
-    values = predict(case, **CONFIG)
-    return {'hours': [{'hour': h, 'q': values[h]} for h in range(2, 25)]}
+    if case.get('levels') != LEVELS:
+        raise ValueError(f'{name}: levels must equal {LEVELS}')
+    forecast = predict(case, **CONFIG)
+    return {'hours': [{'hour': hour, 'q': forecast[hour]} for hour in range(2, 25)]}
 
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(INPUT_DIR.glob('*.in')):
-        case = json.loads(path.read_text(encoding='utf-8'))
-        (OUTPUT_DIR / f'{path.stem}.out').write_text(
-            json.dumps(forecast_case(case, path.name), separators=(',', ':'), allow_nan=False) + '\n', encoding='utf-8')
+    for source in sorted(INPUT_DIR.glob('*.in')):
+        case = json.loads(source.read_text())
+        result = forecast_case(case, source.stem)
+        (OUTPUT_DIR / f'{source.stem}.out').write_text(
+            json.dumps(result, separators=(',', ':'), allow_nan=False) + '\n')
 
 
 if __name__ == '__main__':

@@ -1,95 +1,111 @@
 """Cross-set LOO and entry contract, timing, determinism and fallback checks."""
+
 import json
 import math
 import os
-from pathlib import Path
+import pathlib
 import subprocess
 import sys
 import tempfile
 import time
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
 import main
-from dev.common import KIT, load_case
+from dev.common import KIT, load_case, timestamp
 from dev.tune import run, summary
 
 
 def check(path):
+    path = pathlib.Path(path)
     assert path.stat().st_size <= 65536
-    obj = json.loads(path.read_text())
-    assert set(obj) == {'hours'}
-    assert [r['hour'] for r in obj['hours']] == list(range(2, 25))
-    for row in obj['hours']:
+    output = json.loads(path.read_text(encoding='utf-8'))
+    assert isinstance(output, dict) and set(output) == {'hours'}
+    rows = output['hours']
+    assert isinstance(rows, list)
+    assert [row['hour'] for row in rows] == list(range(2, 25))
+    for row in rows:
         assert set(row) == {'hour', 'q'}
-        q = row['q']
-        assert len(q) == 5 and q == sorted(q)
-        assert all(isinstance(x, (float, int)) and math.isfinite(x) and 0 < x <= 1e9 for x in q)
+        values = row['q']
+        assert isinstance(values, list) and len(values) == 5
+        assert all(type(value) in (int, float) and math.isfinite(value) and 0 < value <= 1e9 for value in values)
+        assert values == sorted(values)
 
 
 def entry(source, dest):
-    env = dict(os.environ, MAKEFUN_INPUT_DIR=str(source), MAKEFUN_OUTPUT_DIR=str(dest))
+    environment = dict(os.environ, MAKEFUN_INPUT_DIR=str(source), MAKEFUN_OUTPUT_DIR=str(dest))
     start = time.perf_counter()
-    subprocess.run([sys.executable, '-P', '-s', str(Path(main.__file__))], env=env, check=True)
+    subprocess.run([sys.executable, '-P', '-s', str(pathlib.Path(__file__).resolve().parents[1] / 'main.py')],
+                   env=environment, check=True)
     return time.perf_counter() - start
 
 
 def validate():
-    cross = []
-    for path in sorted((KIT/'input').glob('*.in')):
-        cs = load_case(path)['comparables']
-        pooled = run(cs, {})
-        chosen = run(cs, main.CONFIG)
-        row = summary(path.stem, main.CONFIG, chosen, pooled)
-        row.update(pooled=pooled['loss'], folds=len(chosen['cases']), skipped=chosen['skipped'])
-        regressions = [(a['loss']-b['loss'], a, b) for a,b in zip(chosen['cases'],pooled['cases'])]
-        delta, a, b = max(regressions, key=lambda x:x[0])
-        row['regression_chosen_loss'] = a['loss']
-        row['regression_pooled_loss'] = b['loss']
-        cross.append(row)
-        print(json.dumps(row), flush=True)
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        elapsed = entry(KIT/'input', root/'a')
-        entry(KIT/'input', root/'b')
-        files = sorted((root/'a').glob('*.out'))
-        assert len(files) == 4
-        validation = dict(all_case_seconds=elapsed, cases=[])
-        for path in files:
-            check(path)
-            assert path.read_bytes() == (root/'b'/path.name).read_bytes()
-            source = root/path.stem
-            source.mkdir()
-            (source/(path.stem+'.in')).write_bytes((KIT/'input'/(path.stem+'.in')).read_bytes())
-            seconds = entry(source, root/'timed'/path.stem)
+    rows = []
+    for source in sorted((KIT / 'input').glob('*.in')):
+        comparables = load_case(source)['comparables']
+        pooled = run(comparables, {})
+        chosen = run(comparables, main.CONFIG)
+        row = summary(source.stem, main.CONFIG, chosen, pooled)
+        chosen_fold, pooled_fold = max(zip(chosen['cases'], pooled['cases']),
+                                      key=lambda pair: (pair[0]['loss'] - pair[1]['loss'], pair[0]['name']))
+        row.update(pooled_loss=pooled['loss'], folds=len(chosen['cases']), skipped=chosen['skipped'],
+                   regression_chosen_loss=chosen_fold['loss'], regression_pooled_loss=pooled_fold['loss'])
+        rows.append(row)
+        print(json.dumps(row))
+    validation = {'cases': []}
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        first = root / 'a'
+        repeat = root / 'b'
+        validation['all_case_seconds'] = entry(KIT / 'input', first)
+        entry(KIT / 'input', repeat)
+        outputs = sorted(first.glob('*.out'))
+        assert len(outputs) == 4
+        assert {path.name for path in repeat.iterdir()} == {path.name for path in outputs}
+        for output in outputs:
+            check(output)
+            assert output.read_bytes() == (repeat / output.name).read_bytes()
+            isolated = root / f'input-{output.stem}'
+            isolated.mkdir()
+            input_name = output.stem + '.in'
+            (isolated / input_name).write_bytes((KIT / 'input' / input_name).read_bytes())
+            timed = root / f'timed-{output.stem}'
+            seconds = entry(isolated, timed)
+            check(timed / output.name)
+            assert output.read_bytes() == (timed / output.name).read_bytes()
             assert seconds < 8
-            validation['cases'].append(dict(id=path.stem, seconds=seconds, bytes=path.stat().st_size))
-        synth = load_case()
-        synth['comparables'] = []
-        synth['known'] = [{'hour':1,'viewers':0}]
-        source = root/'synthetic'
-        source.mkdir()
-        (source/'zero.in').write_text(json.dumps(synth))
-        entry(source, root/'synthetic-out')
-        check(root/'synthetic-out/zero.out')
-        # Exercise missing hour 1, missing history, sparse pairs and cross-hour fallback.
-        synth['known'] = []
-        for history in (synth['history_hourly'], []):
-            synth['history_hourly'] = history
-            if not history:
-                synth['history'] = []
-            out = root/'missing.out'
-            out.write_text(json.dumps(main.forecast_case(synth)))
-            check(out)
-        sparse = load_case()
-        c = next(c for c in sparse['comparables'] if main.prepare(c) is not None)
-        start = main.timestamp(c['day_start'])
-        c['hourly'] = [p for p in c['hourly'] if 0 <= (main.timestamp(p['from'])-start).total_seconds()/3600 < 2]
-        sparse['comparables'] = [c]
-        out = root/'sparse.out'
-        out.write_text(json.dumps(main.forecast_case(sparse)))
-        check(out)
-        validation.update(deterministic=True, contract=True, zero_empty=True, missing_and_sparse=True)
-        print(json.dumps(validation), flush=True)
-    Path('dev/validation-results.json').write_text(json.dumps(dict(cross_sets=cross, validation=validation), indent=2)+'\n')
+            validation['cases'].append({'id': output.stem, 'seconds': seconds, 'bytes': output.stat().st_size})
+        synthetic = load_case()
+        synthetic['comparables'] = []
+        synthetic['known'] = [{'hour': 1, 'viewers': 0}]
+        zero = root / 'zero-input'
+        zero.mkdir()
+        (zero / 'zero.in').write_text(json.dumps(synthetic), encoding='utf-8')
+        entry(zero, root / 'zero-output')
+        check(root / 'zero-output/zero.out')
+        synthetic['known'] = []
+        for index, history in enumerate((synthetic['history_hourly'], [])):
+            synthetic['history_hourly'] = history
+            if index == 1:
+                synthetic['history'] = []
+            output = root / f'missing-{index}.out'
+            output.write_text(json.dumps(main.forecast_case(synthetic)), encoding='utf-8')
+            check(output)
+        comparable = next(comparable for comparable in load_case()['comparables'] if main.prepare(comparable) is not None)
+        start = timestamp(comparable['day_start'])
+        comparable['hourly'] = [point for point in comparable['hourly']
+                                if 0 <= (timestamp(point['from']) - start).total_seconds() < 7200]
+        synthetic['comparables'] = [comparable]
+        output = root / 'sparse.out'
+        output.write_text(json.dumps(main.forecast_case(synthetic)), encoding='utf-8')
+        check(output)
+    validation.update(deterministic=True, contract=True, zero_empty=True, missing_and_sparse=True)
+    print(json.dumps(validation))
+    report = {'cross_sets': rows, 'validation': validation}
+    pathlib.Path(__file__).with_name('validation-results.json').write_text(
+        json.dumps(report, indent=2) + '\n', encoding='utf-8')
+
 
 if __name__ == '__main__':
     validate()
